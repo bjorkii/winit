@@ -6,9 +6,12 @@ use std::ptr;
 use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use core_graphics::event::CGEvent;
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use foreign_types::ForeignType;
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType,
-    NSResponder, NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
+    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -976,24 +979,30 @@ impl WinitView {
                 self.ivars().ime_warmup_done.set(true);
                 if let Some(input_context) = self.inputContext() {
                     self.ivars().ime_suppress_events.set(true);
-                    let characters = NSString::from_str("a");
-                    let synthetic = unsafe {
-                        NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
-                            NSEventType::KeyDown,
-                            NSPoint::ZERO,
-                            NSEventModifierFlags::empty(),
-                            0.0,
-                            self.window().windowNumber(),
-                            None,
-                            &characters,
-                            &characters,
-                            false,
-                            0,
-                        )
-                    };
+                    // A plain synthesized NSEvent is ignored by the input
+                    // method (it inserted the raw character without consulting
+                    // the IME — confirmed by experiment), so build a real
+                    // CGEvent and wrap it: IMKit appears to distinguish
+                    // window-server-backed events from purely synthetic ones.
+                    // The event is only handed to our own input context, never
+                    // posted to the system.
+                    let synthetic: Option<Retained<NSEvent>> = CGEventSource::new(
+                        CGEventSourceStateID::HIDSystemState,
+                    )
+                    .ok()
+                    .and_then(|source| {
+                        // kVK_ANSI_A = 0, key-down
+                        CGEvent::new_keyboard_event(source, 0, true).ok()
+                    })
+                    .and_then(|cg_event| {
+                        let ptr: *mut std::ffi::c_void = cg_event.as_ptr() as *mut _;
+                        unsafe { msg_send_id![NSEvent::class(), eventWithCGEvent: ptr] }
+                    });
                     if let Some(synthetic) = synthetic {
                         let consumed = unsafe { input_context.handleEvent(&synthetic) };
-                        eprintln!("[IME-DBG] warm-up synthetic event sent (consumed={consumed})");
+                        eprintln!("[IME-DBG] warm-up CGEvent sent (consumed={consumed})");
+                    } else {
+                        eprintln!("[IME-DBG] warm-up CGEvent construction FAILED");
                     }
                     unsafe { input_context.discardMarkedText() };
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
