@@ -111,6 +111,19 @@ fn get_left_modifier_code(key: &Key) -> KeyCode {
     }
 }
 
+/// Opaque stand-in for `CGEventRef` carrying the exact Objective-C type
+/// encoding (`^{__CGEvent=}`) expected by `+[NSEvent eventWithCGEvent:]` —
+/// objc2 verifies message encodings in debug builds and rejects `*mut c_void`.
+#[repr(C)]
+struct OpaqueCGEvent {
+    _priv: [u8; 0],
+}
+
+unsafe impl objc2::encode::RefEncode for OpaqueCGEvent {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("__CGEvent", &[]));
+}
+
 #[derive(Debug)]
 pub struct ViewState {
     /// Strong reference to the global application state.
@@ -995,7 +1008,7 @@ impl WinitView {
                         CGEvent::new_keyboard_event(source, 0, true).ok()
                     })
                     .and_then(|cg_event| {
-                        let ptr: *mut std::ffi::c_void = cg_event.as_ptr() as *mut _;
+                        let ptr = cg_event.as_ptr() as *mut OpaqueCGEvent;
                         unsafe { msg_send_id![NSEvent::class(), eventWithCGEvent: ptr] }
                     });
                     if let Some(synthetic) = synthetic {
