@@ -7,8 +7,8 @@ use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType,
+    NSResponder, NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -133,6 +133,16 @@ pub struct ViewState {
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
+
+    /// One-shot: whether the IME warm-up synthetic event has been sent (see
+    /// `set_ime_allowed`). Multi-keystroke IMEs (e.g. Korean) only establish
+    /// their session with this process on the first real key event they see,
+    /// and that first event slips through uncomposed.
+    ime_warmup_done: Cell<bool>,
+
+    /// While true, NSTextInputClient callbacks must not queue any Ime events —
+    /// used during the synthetic warm-up so it stays invisible to the app.
+    ime_suppress_events: Cell<bool>,
 
     // Weak reference because the window keeps a strong reference to the view
     _ns_window: WeakId<WinitWindow>,
@@ -296,10 +306,17 @@ declare_class!(
             };
 
             eprintln!(
-                "[IME-DBG] setMarkedText: {:?} (state={:?})",
+                "[IME-DBG] setMarkedText: {:?} (state={:?}, suppressed={})",
                 string.to_string(),
                 self.ivars().ime_state.get(),
+                self.ivars().ime_suppress_events.get(),
             );
+
+            // Invisible IME warm-up in progress (see `set_ime_allowed`) — the
+            // synthetic event's composition must not reach the app.
+            if self.ivars().ime_suppress_events.get() {
+                return;
+            }
 
             // Update marked text.
             *self.ivars().marked_text.borrow_mut() = marked_text;
@@ -344,6 +361,10 @@ declare_class!(
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
             eprintln!("[IME-DBG] unmarkText (state={:?})", self.ivars().ime_state.get());
+            // Invisible IME warm-up in progress (see `set_ime_allowed`).
+            if self.ivars().ime_suppress_events.get() {
+                return;
+            }
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
             let input_context = self.inputContext().expect("input context");
@@ -415,12 +436,18 @@ declare_class!(
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
             eprintln!(
-                "[IME-DBG] insertText: {:?} (state={:?}, has_marked={}, is_control={})",
+                "[IME-DBG] insertText: {:?} (state={:?}, has_marked={}, is_control={}, suppressed={})",
                 string,
                 self.ivars().ime_state.get(),
                 unsafe { self.hasMarkedText() },
                 is_control,
+                self.ivars().ime_suppress_events.get(),
             );
+
+            // Invisible IME warm-up in progress (see `set_ime_allowed`).
+            if self.ivars().ime_suppress_events.get() {
+                return;
+            }
 
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
@@ -436,6 +463,10 @@ declare_class!(
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
             eprintln!("[IME-DBG] doCommandBySelector (state={:?})", self.ivars().ime_state.get());
+            // Invisible IME warm-up in progress (see `set_ime_allowed`).
+            if self.ivars().ime_suppress_events.get() {
+                return;
+            }
             // We shouldn't forward any character from just committed text, since we'll end up sending
             // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
             // which is not desired given it was used to confirm IME input.
@@ -846,6 +877,8 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
+            ime_warmup_done: Default::default(),
+            ime_suppress_events: Default::default(),
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
         });
@@ -930,14 +963,43 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         if self.ivars().ime_allowed.get() {
-            // Eagerly engage the OS input context. Without this, engagement with
-            // the active input method happens lazily, and with multi-keystroke
-            // IMEs (e.g. Korean) the first syllable typed right after enabling
-            // is processed before the IME is engaged — each keystroke commits as
-            // a raw jamo instead of composing
-            // (https://github.com/rust-windowing/winit/issues/3095).
-            if let Some(input_context) = self.inputContext() {
-                unsafe { input_context.activate() };
+            // Warm up the input method session. Multi-keystroke IMEs (e.g.
+            // Korean) establish their session with this process only on the
+            // first real key event they receive, and that event itself slips
+            // through uncomposed — the "first character of the session
+            // decomposes into jamo" symptom of winit#3095 (explicit
+            // NSTextInputContext.activate() does not perform this handshake;
+            // confirmed by experiment). Send one synthetic key event through
+            // the input context with all Ime callbacks suppressed, then discard
+            // whatever composition it started.
+            if !self.ivars().ime_warmup_done.get() {
+                self.ivars().ime_warmup_done.set(true);
+                if let Some(input_context) = self.inputContext() {
+                    self.ivars().ime_suppress_events.set(true);
+                    let characters = NSString::from_str("a");
+                    let synthetic = unsafe {
+                        NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                            NSEventType::KeyDown,
+                            NSPoint::ZERO,
+                            NSEventModifierFlags::empty(),
+                            0.0,
+                            self.window().windowNumber(),
+                            None,
+                            &characters,
+                            &characters,
+                            false,
+                            0,
+                        )
+                    };
+                    if let Some(synthetic) = synthetic {
+                        let consumed = unsafe { input_context.handleEvent(&synthetic) };
+                        eprintln!("[IME-DBG] warm-up synthetic event sent (consumed={consumed})");
+                    }
+                    unsafe { input_context.discardMarkedText() };
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.ivars().ime_state.set(ImeState::Disabled);
+                    self.ivars().ime_suppress_events.set(false);
+                }
             }
             return;
         }
