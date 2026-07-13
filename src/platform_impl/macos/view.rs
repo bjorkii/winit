@@ -889,6 +889,16 @@ impl WinitView {
         // Clear markedText
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
+        // Also discard the composition state held by the OS input context itself.
+        // Without this, IMEs with multi-keystroke composition (e.g. Korean) keep
+        // their in-progress composition across an allowed=false/true toggle and
+        // flush it into whatever receives the next keystroke — the "previous
+        // field's last jamo leaks into the newly focused field" bug
+        // (https://github.com/rust-windowing/winit/issues/3095 family).
+        if let Some(input_context) = self.inputContext() {
+            input_context.discardMarkedText();
+        }
+
         if self.ivars().ime_state.get() != ImeState::Disabled {
             self.ivars().ime_state.set(ImeState::Disabled);
             self.queue_event(WindowEvent::Ime(Ime::Disabled));
