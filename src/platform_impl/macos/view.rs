@@ -321,13 +321,6 @@ declare_class!(
                 )
             };
 
-            eprintln!(
-                "[IME-DBG] setMarkedText: {:?} (state={:?}, suppressed={})",
-                string.to_string(),
-                self.ivars().ime_state.get(),
-                self.ivars().ime_suppress_events.get(),
-            );
-
             // Invisible IME warm-up in progress (see `set_ime_allowed`) — the
             // synthetic event's composition must not reach the app.
             if self.ivars().ime_suppress_events.get() {
@@ -376,7 +369,6 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
-            eprintln!("[IME-DBG] unmarkText (state={:?})", self.ivars().ime_state.get());
             // Invisible IME warm-up in progress (see `set_ime_allowed`).
             if self.ivars().ime_suppress_events.get() {
                 return;
@@ -451,15 +443,6 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            eprintln!(
-                "[IME-DBG] insertText: {:?} (state={:?}, has_marked={}, is_control={}, suppressed={})",
-                string,
-                self.ivars().ime_state.get(),
-                unsafe { self.hasMarkedText() },
-                is_control,
-                self.ivars().ime_suppress_events.get(),
-            );
-
             // Invisible IME warm-up in progress (see `set_ime_allowed`).
             if self.ivars().ime_suppress_events.get() {
                 return;
@@ -478,7 +461,6 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
-            eprintln!("[IME-DBG] doCommandBySelector (state={:?})", self.ivars().ime_state.get());
             // Invisible IME warm-up in progress (see `set_ime_allowed`).
             if self.ivars().ime_suppress_events.get() {
                 return;
@@ -507,16 +489,7 @@ declare_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
-                eprintln!(
-                    "[IME-DBG] keyDown: prev_src={:?} cur_src={:?} state={:?} allowed={} marked_len={}",
-                    *prev_input_source,
-                    current_input_source,
-                    self.ivars().ime_state.get(),
-                    self.ivars().ime_allowed.get(),
-                    self.ivars().marked_text.borrow().length(),
-                );
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
-                    eprintln!("[IME-DBG] keyDown: input-source change branch FIRED -> forcing ImeState::Disabled");
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
                     self.ivars().ime_state.set(ImeState::Disabled);
@@ -536,24 +509,8 @@ declare_class!(
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
-                // Route key events through the input context (Apple's documented
-                // path for NSTextInputClient views) rather than only
-                // interpretKeyEvents: the latter fails to consult the input
-                // method for the very first key event that reaches this process,
-                // so multi-keystroke IMEs (e.g. Korean) leak that keystroke as a
-                // raw character instead of starting composition (winit#3095's
-                // "first character decomposes" symptom). Fall back to
-                // interpretKeyEvents when the input context doesn't consume the
-                // event so key-binding commands (doCommandBySelector) still work.
-                let handled = self
-                    .inputContext()
-                    .map(|ctx| unsafe { ctx.handleEvent(&event) })
-                    .unwrap_or(false);
-                eprintln!("[IME-DBG] keyDown: inputContext.handleEvent consumed={handled}");
-                if !handled {
-                    let events_for_nsview = NSArray::from_slice(&[&*event]);
-                    unsafe { self.interpretKeyEvents(&events_for_nsview) };
-                }
+                let events_for_nsview = NSArray::from_slice(&[&*event]);
+                unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -968,12 +925,6 @@ impl WinitView {
     }
 
     pub(super) fn set_ime_allowed(&self, ime_allowed: bool) {
-        eprintln!(
-            "[IME-DBG] set_ime_allowed({}) (was={}, state={:?})",
-            ime_allowed,
-            self.ivars().ime_allowed.get(),
-            self.ivars().ime_state.get(),
-        );
         if self.ivars().ime_allowed.get() == ime_allowed {
             return;
         }
@@ -1012,10 +963,7 @@ impl WinitView {
                         unsafe { msg_send_id![NSEvent::class(), eventWithCGEvent: ptr] }
                     });
                     if let Some(synthetic) = synthetic {
-                        let consumed = unsafe { input_context.handleEvent(&synthetic) };
-                        eprintln!("[IME-DBG] warm-up CGEvent sent (consumed={consumed})");
-                    } else {
-                        eprintln!("[IME-DBG] warm-up CGEvent construction FAILED");
+                        let _consumed = unsafe { input_context.handleEvent(&synthetic) };
                     }
                     unsafe { input_context.discardMarkedText() };
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
