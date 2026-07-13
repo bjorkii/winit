@@ -295,6 +295,12 @@ declare_class!(
                 )
             };
 
+            eprintln!(
+                "[IME-DBG] setMarkedText: {:?} (state={:?})",
+                string.to_string(),
+                self.ivars().ime_state.get(),
+            );
+
             // Update marked text.
             *self.ivars().marked_text.borrow_mut() = marked_text;
 
@@ -337,6 +343,7 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
+            eprintln!("[IME-DBG] unmarkText (state={:?})", self.ivars().ime_state.get());
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
             let input_context = self.inputContext().expect("input context");
@@ -407,6 +414,14 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
+            eprintln!(
+                "[IME-DBG] insertText: {:?} (state={:?}, has_marked={}, is_control={})",
+                string,
+                self.ivars().ime_state.get(),
+                unsafe { self.hasMarkedText() },
+                is_control,
+            );
+
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
@@ -420,6 +435,7 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
+            eprintln!("[IME-DBG] doCommandBySelector (state={:?})", self.ivars().ime_state.get());
             // We shouldn't forward any character from just committed text, since we'll end up sending
             // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
             // which is not desired given it was used to confirm IME input.
@@ -444,7 +460,16 @@ declare_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
+                eprintln!(
+                    "[IME-DBG] keyDown: prev_src={:?} cur_src={:?} state={:?} allowed={} marked_len={}",
+                    *prev_input_source,
+                    current_input_source,
+                    self.ivars().ime_state.get(),
+                    self.ivars().ime_allowed.get(),
+                    self.ivars().marked_text.borrow().length(),
+                );
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                    eprintln!("[IME-DBG] keyDown: input-source change branch FIRED -> forcing ImeState::Disabled");
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
                     self.ivars().ime_state.set(ImeState::Disabled);
@@ -878,6 +903,12 @@ impl WinitView {
     }
 
     pub(super) fn set_ime_allowed(&self, ime_allowed: bool) {
+        eprintln!(
+            "[IME-DBG] set_ime_allowed({}) (was={}, state={:?})",
+            ime_allowed,
+            self.ivars().ime_allowed.get(),
+            self.ivars().ime_state.get(),
+        );
         if self.ivars().ime_allowed.get() == ime_allowed {
             return;
         }
