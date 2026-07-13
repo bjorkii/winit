@@ -489,8 +489,24 @@ declare_class!(
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
-                let events_for_nsview = NSArray::from_slice(&[&*event]);
-                unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                // Route key events through the input context (Apple's documented
+                // path for NSTextInputClient views) rather than only
+                // interpretKeyEvents: the latter fails to consult the input
+                // method for the very first key event that reaches this process,
+                // so multi-keystroke IMEs (e.g. Korean) leak that keystroke as a
+                // raw character instead of starting composition (winit#3095's
+                // "first character decomposes" symptom). Fall back to
+                // interpretKeyEvents when the input context doesn't consume the
+                // event so key-binding commands (doCommandBySelector) still work.
+                let handled = self
+                    .inputContext()
+                    .map(|ctx| unsafe { ctx.handleEvent(&event) })
+                    .unwrap_or(false);
+                eprintln!("[IME-DBG] keyDown: inputContext.handleEvent consumed={handled}");
+                if !handled {
+                    let events_for_nsview = NSArray::from_slice(&[&*event]);
+                    unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                }
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
