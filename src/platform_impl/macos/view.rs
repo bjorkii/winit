@@ -883,6 +883,15 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         if self.ivars().ime_allowed.get() {
+            // Eagerly engage the OS input context. Without this, engagement with
+            // the active input method happens lazily, and with multi-keystroke
+            // IMEs (e.g. Korean) the first syllable typed right after enabling
+            // is processed before the IME is engaged — each keystroke commits as
+            // a raw jamo instead of composing
+            // (https://github.com/rust-windowing/winit/issues/3095).
+            if let Some(input_context) = self.inputContext() {
+                unsafe { input_context.activate() };
+            }
             return;
         }
 
