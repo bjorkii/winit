@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::mem;
+use std::path::PathBuf;
 use std::rc::Weak;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use objc2::rc::Retained;
@@ -8,7 +10,27 @@ use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
 };
-use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
+use objc2_foundation::{MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSURL};
+
+// Finder가 더블클릭/"다음으로 열기"로 여는 문서 경로를 받기 위함(korean-ime 브랜치에 얹은
+// 두 번째, 별개의 패치 — PDF Outliner 앱이 이 파일-열기 Apple Event를 winit이 전혀
+// 지원하지 않아 필요로 함). `application:openURLs:`는 콜드 스타트(앱이 안 떠 있을 때
+// 문서로 실행)와 이미 실행 중인 인스턴스에 대한 재오픈 요청 둘 다에서 호출되는 최신
+// API(macOS 10.13+, 구식 `application:openFile:`을 대체) — 콜드 스타트 문서 열기는
+// `NSApplication`의 `finishLaunching` 시퀀스 도중, 즉 `applicationDidFinishLaunching:`
+// 알림이 뜨기도 전에 델리게이트로 동기 호출되기 때문에, 앱(winit을 쓰는 쪽) 코드가 아무리
+// 일찍 자체적으로 후킹해도 따라잡을 수 없다 — 반드시 winit 자신의 델리게이트 클래스가
+// 이 메서드를 구현해야 한다.
+fn pending_opened_files() -> &'static Mutex<Vec<PathBuf>> {
+    static PENDING_OPENED_FILES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    PENDING_OPENED_FILES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 지금까지 Finder가 열어달라고 요청한(아직 안 가져간) 문서 경로를 꺼내면서 비운다.
+/// `winit::platform::macos::take_opened_files()`로 공개된다.
+pub(crate) fn take_opened_files() -> Vec<PathBuf> {
+    std::mem::take(&mut *pending_opened_files().lock().unwrap())
+}
 
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
@@ -70,6 +92,11 @@ declare_class!(
         fn app_will_terminate(&self, notification: &NSNotification) {
             self.will_terminate(notification)
         }
+
+        #[method(application:openURLs:)]
+        fn app_open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            self.open_urls(urls)
+        }
     }
 );
 
@@ -100,6 +127,21 @@ impl ApplicationDelegate {
             pending_redraw: RefCell::new(vec![]),
         });
         unsafe { msg_send_id![super(this), init] }
+    }
+
+    /// Finder가 문서를 열어달라고 요청(더블클릭/"다음으로 열기"/재오픈)한 URL들을 받는다.
+    /// 파일 URL이 아닌 것(원격 URL 등)은 건너뛴다 — 이 델리게이트 메서드가 콜드 스타트에도
+    /// 불리는 이유는 위 `pending_opened_files` 주석 참고.
+    fn open_urls(&self, urls: &NSArray<NSURL>) {
+        let mut paths = Vec::new();
+        for url in urls.iter() {
+            if let Some(path) = unsafe { url.path() } {
+                paths.push(PathBuf::from(path.to_string()));
+            }
+        }
+        if !paths.is_empty() {
+            pending_opened_files().lock().unwrap().extend(paths);
+        }
     }
 
     // NOTE: This will, globally, only be run once, no matter how many

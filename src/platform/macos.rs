@@ -91,6 +91,18 @@ use crate::event_loop::{ActiveEventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
 
+/// Returns (and clears) any document paths Finder has asked this application to open —
+/// via double-click, "Open With", or by reopening a file while the app is already running.
+///
+/// Winit itself does not support macOS's document-open Apple Event
+/// (`application:openURLs:`); this is a PDF Outliner-specific addition (see
+/// `korean-ime-discard-marked-text-0.30.13` branch history) so that applications using this
+/// fork can receive it. Poll this once per frame/event — cold-start opens and
+/// already-running reopens are both delivered through the same queue.
+pub fn take_opened_files() -> Vec<std::path::PathBuf> {
+    crate::platform_impl::take_opened_files()
+}
+
 /// Additional methods on [`Window`] that are specific to MacOS.
 pub trait WindowExtMacOS {
     /// Returns whether or not the window is in simple fullscreen mode.
